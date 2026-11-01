@@ -43,17 +43,27 @@
     names.push(d.n.split("(")[0].trim().toLowerCase());
     names.push(k.replace(/_/g, " "));
     names.push(k.split("_")[0]);
-    uniq(names).forEach(function (n) { if (n && n.length > 1) DRUG_NAMES.push([n.toLowerCase(), k]); });
+    uniq(names).forEach(function (n) { if (n && n.length > 1) DRUG_NAMES.push([n.toLowerCase().replace(/[-_]/g, " "), k]); });
   });
+  var BR = typeof BRANDS !== "undefined" ? BRANDS : {};
+  Object.keys(BR).forEach(function (b) { BR[b][1].forEach(function (k) { if (DRUGS[k]) DRUG_NAMES.push([b, k]); }); });
   DRUG_NAMES.sort(function (a, b) { return b[0].length - a[0].length; });
 
   function matchDrugText(text) {
-    var t = " " + String(text || "").toLowerCase() + " ", out = [];
+    var t = " " + String(text || "").toLowerCase().replace(/[-_]/g, " ") + " ", out = [];
     DRUG_NAMES.forEach(function (p) {
       var re = new RegExp("(?:^|[^a-z0-9])" + escRe(p[0]) + "(?![a-z])", "i");
       if (re.test(t)) out.push(p[1]);
     });
     return uniq(out);
+  }
+  function brandHits(text) {
+    var t = " " + String(text || "").toLowerCase().replace(/[-_]/g, " ") + " ", out = [];
+    Object.keys(BR).sort(function (a, b) { return b.length - a.length; }).forEach(function (b) {
+      var re = new RegExp("(?:^|[^a-z0-9])" + escRe(b) + "(?![a-z])", "i");
+      if (re.test(t)) { out.push({ brand: b, comp: BR[b][0], keys: BR[b][1], warn: BR[b][2] || "" }); t = t.replace(re, " "); }
+    });
+    return out;
   }
   function resolveDrug(name) {
     var n = String(name || "").trim().toLowerCase();
@@ -222,7 +232,7 @@
   function redFlags(ext, P, labs) {
     var out = [], pr = ext.present;
     RED_FLAGS.forEach(function (r) {
-      var hit = r.all ? r.all.every(function (k) { return pr[k]; }) : r.any.some(function (k) { return pr[k]; });
+      var hit = (!r.all || r.all.every(function (k) { return pr[k]; })) && (!r.any || r.any.some(function (k) { return pr[k]; }));
       if (hit) out.push({ lvl: r.lvl, t: r.t });
     });
     var v = P.vitals, temp = v.temp || ext.tempF;
@@ -277,7 +287,8 @@
 
   /* ---------- analyse ---------- */
   function analyze() {
-    var text = $("complaint").value;
+    var pain = painPhrases();
+    var text = $("complaint").value + (pain.length ? ". " + pain.join(". ") : "");
     runConsultLabs();
     if (!text.trim() && !S.labs.tags.length) { toast("Type, dictate or paste lab values first"); return; }
     var P = getPatient();
@@ -357,10 +368,12 @@
       (c.id !== "custom" ? '<button class="btn sm ghost" id="rebuildBtn">Rebuild from protocol</button>' : "") + "</div>";
     if (c.emergency) h += '<div class="alert emergency">🚨 EMERGENCY CONDITION - stabilise and transfer. Do not manage as outpatient.</div>';
     if (c.rxNote) h += '<div class="alert urgent">' + esc(c.rxNote) + "</div>";
-    h += '<div class="form-grid"><label style="grid-column:span 2">Final / provisional diagnosis<input id="fDx" value="' + esc(c.name) + '" placeholder="Enter diagnosis"></label><label>ICD-10<input id="fIcd" value="' + esc(c.icd) + '"></label></div>';
+    h += '<div class="form-grid"><label style="grid-column:span 2">Final / provisional diagnosis<input id="fDx" list="icdList" value="' + esc(c.name) + '" placeholder="Type any diagnosis - ICD-10 suggestions load from the web"></label><label>ICD-10<input id="fIcd" value="' + esc(c.icd) + '"></label></div>';
     h += '<h3>Prescription (℞)</h3><div id="rxBox"></div>';
     h += '<div class="row-btns"><input id="addDrugIn" list="drugNames" placeholder="Add medicine (generic or brand)"><button class="btn" id="addDrugBtn">+ Add to prescription</button></div>';
     h += '<h3>Interaction check</h3><div id="rxIx"></div>';
+    h += '<div id="painPlan"></div>';
+    h += '<h3>Online verification</h3><div class="row-btns" style="margin-top:0"><button class="btn" id="verifyBtn">🌐 Verify prescription with FDA labels + fetch patient education</button></div><div id="webVerify"></div>';
     h += '<div class="grid2" style="margin-top:12px"><label>Investigations advised (one per line)<textarea id="fInv" rows="5">' + esc((c.inv || []).join("\n")) + '</textarea></label>' +
       '<label>Advice for patient (one per line)<textarea id="fAdv" rows="5">' + esc((c.adv || []).join("\n")) + "</textarea></label></div>";
     h += '<div class="grid2"><label>Come back immediately if (one per line)<textarea id="fRf" rows="4">' + esc((c.rf || []).join("\n")) + '</textarea></label>' +
@@ -375,12 +388,18 @@
     $("addDrugIn").addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); addDrugFromInput(); } });
     $("reportBtn").addEventListener("click", prepareReport);
     if ($("rebuildBtn")) $("rebuildBtn").addEventListener("click", function () { S.rx = buildRx(S.cond, getPatient()); renderRx(); toast("Plan rebuilt with current patient details"); });
+    $("verifyBtn").addEventListener("click", verifyOnline);
+    bindIcdAutocomplete();
+    S.webEdu = [];
+    renderPainPlan();
   }
 
   function qty(l) {
     var s = String(l.s || "").trim();
-    if (l.u === "tab" || l.u === "cap" || l.u === "pessary") {
+    if (l.u === "tab" || l.u === "cap" || l.u === "pessary" || l.u === "inj") {
       var days = parseFloat(l.days) || 0;
+      var tm = s.match(/^(\d+)\s*times? a day$/i);
+      if (tm) return String(parseInt(tm[1], 10) * days || "-");
       if (/^\d+(\s*-\s*\d+){2,3}$/.test(s)) {
         var per = s.split("-").reduce(function (a, b) { return a + (parseFloat(b) || 0); }, 0);
         return per * days ? String(per * days) : "-";
@@ -432,6 +451,7 @@
       });
     }
     renderRxIx();
+    if ($("painPlan") && $("painPlan").innerHTML) renderPainPlan();
   }
   function activeRx() { return S.rx.filter(function (l) { return l.st !== "block" || l.override; }); }
   function renderRxIx() {
@@ -443,6 +463,7 @@
     var h = dupes.length ? '<div class="alert urgent">Duplicate medicine in prescription: ' + esc(dupes.join(", ")) + "</div>" : "";
     if (keys.length < 2) h += '<div class="hint">Add 2 or more medicines (including the patient\'s current medicines) to check interactions.</div>';
     else h += ixHtml(interactions(keys));
+    brandHits(P.medsText).forEach(function (b) { if (b.warn) h += '<div class="alert caution">Current medicine ' + esc(b.brand.toUpperCase()) + " (" + esc(b.comp) + "): " + esc(b.warn) + "</div>"; });
     if (P.medKeys.length) h += '<div class="hint">Current medicines recognised: ' + esc(P.medKeys.map(function (k) { return DRUGS[k].n; }).join(", ")) + "</div>";
     box.innerHTML = h;
   }
@@ -460,9 +481,12 @@
     return true;
   }
   function addDrugFromInput() {
-    var v = $("addDrugIn").value, k = resolveDrug(v);
-    if (!k) { toast("Medicine not found in formulary"); return; }
-    if (addDrugKey(k)) { $("addDrugIn").value = ""; toast(DRUGS[k].n + " added"); }
+    var v = $("addDrugIn").value, bh = brandHits(v), ks = [];
+    if (bh.length) { bh.forEach(function (b) { ks = ks.concat(b.keys); if (b.warn) toast(b.brand.toUpperCase() + ": " + b.warn); }); }
+    else { var k = resolveDrug(v); if (k) ks = [k]; }
+    if (!ks.length) { toast(bh.length ? "This brand has no safe formulary component - see warning" : "Medicine not in offline formulary - search it in Web Medical Library"); return; }
+    var added = ks.filter(function (k) { return addDrugKey(k); });
+    if (added.length) { $("addDrugIn").value = ""; toast(added.map(function (k) { return DRUGS[k].n; }).join(" + ") + " added"); }
   }
 
   /* ---------- report ---------- */
@@ -489,7 +513,8 @@
       inv: lines("fInv"), adv: lines("fAdv"), rf: lines("fRf"), notes: $("fNotes").value.trim(), fu: $("fFu").value.trim(), ref: $("fRef").value.trim(),
       prog: S.cond.prog || "",
       labs: { findings: S.labs.findings.filter(function (f) { return f.status !== "Normal"; }), normal: S.labs.findings.filter(function (f) { return f.status === "Normal"; }).map(function (f) { return f.name + " " + f.value; }), notes: S.labs.notes.slice() },
-      att: S.attachments.map(function (a) { return { name: a.name, kind: a.kind, thumb: a.thumb || null }; })
+      att: S.attachments.map(function (a) { return { name: a.name, kind: a.kind, thumb: a.thumb || null }; }),
+      pain: painSummary(), edu: (S.webEdu || []).slice(0, 3)
     };
     if (!D.dx) { toast("Enter a diagnosis first"); $("fDx").focus(); return; }
     S.current = D;
@@ -540,6 +565,7 @@
     if (D.adv.length) { out.push(""); out.push("HELPFUL TIPS:"); D.adv.forEach(function (a) { out.push("- " + a); }); }
     if (D.rf.length) { out.push(""); out.push("COME BACK IMMEDIATELY IF:"); D.rf.forEach(function (a) { out.push("- " + a); }); }
     if (D.fu) { out.push(""); out.push("Follow-up: " + D.fu); }
+    if (D.edu && D.edu.length) { out.push(""); out.push("Read more: " + D.edu.map(function (e) { return e.url; }).join(" , ")); }
     return out.join("\n");
   }
 
@@ -557,6 +583,7 @@
     if (v.spo2) vit.push("SpO2 " + v.spo2 + "%"); if (v.rr) vit.push("RR " + v.rr + "/min"); if (p.egfr) vit.push("eGFR " + p.egfr);
     if (vit.length) h += '<div class="rp-sec"><h4>Vitals</h4>' + esc(vit.join(" · ")) + "</div>";
     if (D.complaint) h += '<div class="rp-sec"><h4>Presenting complaints</h4>' + esc(D.complaint) + "</div>";
+    if (D.pain) h += '<div class="rp-sec"><h4>Pain assessment</h4>' + esc(D.pain) + "</div>";
     if (D.symptoms.length || D.negatives.length) h += '<div class="rp-sec"><h4>Clinical features</h4>' + esc(D.symptoms.join(", ")) + (D.negatives.length ? '<br><span class="hint">Negatives: ' + esc(D.negatives.join(", ")) + "</span>" : "") + "</div>";
     if (D.notes) h += '<div class="rp-sec"><h4>Examination / doctor\'s notes</h4>' + esc(D.notes).replace(/\n/g, "<br>") + "</div>";
     if (D.flags.length) { h += '<div class="rp-sec"><h4>Alerts</h4>'; D.flags.forEach(function (f) { h += '<div class="alert ' + f.lvl + '">' + esc(f.t) + "</div>"; }); h += "</div>"; }
@@ -599,6 +626,7 @@
     var fu = [];
     if (D.fu) fu.push("<b>Follow-up:</b> " + esc(D.fu)); if (D.ref) fu.push("<b>Referral:</b> " + esc(D.ref)); if (D.prog) fu.push("<b>Expected course:</b> " + esc(D.prog));
     if (fu.length) h += '<div class="rp-sec"><h4>Follow-up &amp; outlook</h4>' + fu.join("<br>") + "</div>";
+    if (D.edu && D.edu.length) h += '<div class="rp-sec"><h4>Read more (MedlinePlus, NIH)</h4>' + D.edu.map(function (e) { return esc(e.title) + ": " + esc(e.url); }).join("<br>") + "</div>";
     if (D.att.length) {
       h += '<div class="rp-sec"><h4>Attachments reviewed</h4><div class="rp-att">';
       D.att.forEach(function (a) { h += a.thumb ? '<div><img src="' + a.thumb + '" alt=""><div class="hint">' + esc(a.kind + ": " + a.name) + "</div></div>" : '<div class="hint">📎 ' + esc(a.kind + ": " + a.name) + "</div>"; });
@@ -746,7 +774,13 @@
     var keys = Object.keys(DRUGS).filter(function (k) {
       var d = DRUGS[k]; return !q || [d.n, d.cls, (d.al || []).join(" "), k].join(" ").toLowerCase().indexOf(q) >= 0;
     }).sort(function (a, b) { return DRUGS[a].n.localeCompare(DRUGS[b].n); });
-    $("drugList").innerHTML = keys.length ? keys.map(function (k) {
+    var brandHtml = "";
+    if (q.length >= 2) {
+      var bm = Object.keys(BR).filter(function (b) { return b.indexOf(q) >= 0 || BR[b][0].toLowerCase().indexOf(q) >= 0; }).slice(0, 12);
+      if (bm.length) brandHtml = '<div class="drug" style="grid-column:1/-1"><div class="dn">Indian brand index</div>' + bm.map(function (b) {
+        return "<p><b>" + esc(b.toUpperCase()) + "</b> = " + esc(BR[b][0]) + (BR[b][2] ? ' <span class="status warn">' + esc(BR[b][2]) + "</span>" : "") + "</p>"; }).join("") + "</div>";
+    }
+    $("drugList").innerHTML = brandHtml + (keys.length ? keys.map(function (k) {
       var d = DRUGS[k], ci = d.block ? Object.keys(d.block).map(function (f) { return d.block[f]; }) : [], ca = d.warn ? Object.keys(d.warn).map(function (f) { return (FLAG_LABEL[f] || f) + ": " + d.warn[f]; }) : [];
       return '<div class="drug"><div class="dn">' + esc(d.n) + '</div><div class="dc">' + esc(d.cls) + " · " + esc(d.st) + "</div>" +
         (d.al && d.al.length ? "<p><b>Also known as:</b> " + esc(d.al.join(", ")) + "</p>" : "") +
@@ -754,7 +788,7 @@
         (d.allergy ? "<p><b>Allergy group:</b> " + esc(d.allergy.join(", ")) + "</p>" : "") +
         (ci.length ? "<p><b>Blocked in:</b> " + esc(ci.join("; ")) + "</p>" : "") + (ca.length ? "<p><b>Cautions:</b> " + esc(ca.join("; ")) + "</p>" : "") +
         (d.def ? '<button class="btn sm" data-add="' + k + '">+ Add to prescription</button>' : '<span class="hint">Reference / interaction checking only</span>') + "</div>";
-    }).join("") : '<p class="hint">No medicine found.</p>';
+    }).join("") : (brandHtml ? "" : '<p class="hint">Not in the offline formulary - try the Web Medical Library tab.</p>'));
     qsa("[data-add]", $("drugList")).forEach(function (b) { b.addEventListener("click", function () { if (addDrugKey(b.getAttribute("data-add"))) { toast(DRUGS[b.getAttribute("data-add")].n + " added - open Smart Consult"); } }); });
   }
 
@@ -865,7 +899,9 @@
   function resetConsult() {
     ["pName", "pAge", "pWt", "pPhone", "pEgfr", "pMeds", "vTemp", "vSbp", "vDbp", "vPulse", "vSpo2", "vRr", "complaint", "labText"].forEach(function (id) { $(id).value = ""; });
     $("pSex").value = "";
-    qsa("#flagBox input, #allergyBox input").forEach(function (i) { i.checked = false; });
+    qsa("#flagBox input, #allergyBox input, #painAgg input, #painRel input, #painAssoc input").forEach(function (i) { i.checked = false; });
+    ["painSite", "painOnset", "painChar", "painRad", "painTime", "painDur"].forEach(function (id) { $(id).value = ""; });
+    $("painSev").value = 0; updatePainSummary();
     S.attachments.forEach(function (a) { if (a.url) try { URL.revokeObjectURL(a.url); } catch (e) { /* ignore */ } });
     S.cond = null; S.ddx = []; S.ext = null; S.flags = []; S.rx = []; S.attachments = []; S.labs = { findings: [], tags: [], notes: [] }; S.current = null;
     $("results").innerHTML = ""; $("labOut").innerHTML = ""; renderThumbs(); $("fileIn").value = "";
@@ -885,9 +921,345 @@
     ["Diabetes labs", "Excessive thirst and excessive urination", "Fasting blood sugar 168 mg/dL, HbA1c 8.1 %, Serum creatinine 0.9"]
   ];
 
+  /* ---------- pain assessment (SOCRATES) ---------- */
+  var PAIN = {
+    site: [["", "-"], ["head", "Head (whole)", "headache"], ["head1", "One side of head", "one sided headache"], ["eye1", "Around one eye", "pain around one eye"],
+      ["face", "Face / cheek", "facial pain"], ["eye", "Eye", "eye pain"], ["ear", "Ear", "ear pain"], ["tooth", "Tooth / jaw", "toothache"], ["throat", "Throat", "sore throat"],
+      ["neck", "Neck", "neck pain"], ["shoulder", "Shoulder", "shoulder pain"], ["elbow", "Elbow", "elbow pain"], ["hand", "Wrist / fingers", "wrist and finger pain"],
+      ["chest", "Chest (centre / left)", "chest pain"], ["chestwall", "Chest wall / ribs", "rib pain"], ["epi", "Upper abdomen (epigastrium)", "epigastric pain"],
+      ["ruq", "Right upper abdomen", "right upper abdominal pain"], ["umb", "Around navel", "around navel"], ["rlq", "Right lower abdomen", "right lower abdominal pain"],
+      ["pelvic", "Lower abdomen / pelvis", "lower abdominal pain"], ["abd", "Whole abdomen", "abdominal pain"], ["flank", "Flank / loin", "flank pain"],
+      ["back", "Lower back", "low back pain"], ["hip", "Hip / groin on walking", "hip pain"], ["knee", "Knee", "knee pain"], ["ankle", "Ankle", "ankle pain"],
+      ["heel", "Heel", "heel pain"], ["toe", "Big toe", "big toe pain"], ["calf", "Calf", "calf pain"], ["joints", "Many joints", "joint pain"],
+      ["smalljoints", "Small joints of hands", "small joints pain"], ["body", "Whole body / muscles", "body ache"], ["anus", "Anus / rectum", "anal pain"],
+      ["testis", "Testis / scrotum", "testicular pain"], ["period", "Period pain", "period pain"], ["skin", "Skin - one-sided band", "burning pain"], ["feet", "Feet (burning / tingling)", "burning feet"]],
+    chr: [["", "-"], ["sharp", "Sharp / stabbing"], ["dull", "Dull / aching"], ["burning", "Burning"], ["throbbing", "Throbbing / pulsating"], ["colicky", "Colicky (comes in waves)"],
+      ["pressure", "Crushing / pressure / heaviness"], ["electric", "Electric / shooting"], ["tearing", "Tearing"], ["cramping", "Cramping"]],
+    rad: [["", "-"], ["none", "Does not radiate"], ["larm", "To left arm / jaw", "radiating to left arm"], ["arm", "Down the arm", "radiating to arm"], ["back", "To the back", "radiating to back"],
+      ["groin", "To the groin", "radiating to groin"], ["leg", "Down the leg", "radiating to leg"], ["rshoulder", "To right shoulder", "radiating to right shoulder"],
+      ["migr", "Started at navel, moved to right lower abdomen", "around navel. right lower abdominal pain"]],
+    time: [["", "-"], ["const", "Constant"], ["waves", "Comes and goes in waves", "comes and goes in waves"], ["night", "Worse at night / at rest", "pain at night"],
+      ["morning", "Morning stiffness over 30 min", "morning stiffness"], ["firststep", "Worst with first steps in morning", "first step pain in morning"],
+      ["exert", "Only on exertion", "on exertion"], ["meals", "After meals", "after heavy meal"], ["hungry", "When stomach is empty", "pain when hungry"],
+      ["clock", "Short attacks, same time daily", "same time every night headache"]],
+    agg: [["move", "Movement"], ["breath", "Breathing / coughing", "worse on breathing"], ["exert", "Exertion", "on exertion"], ["fatty", "Fatty / heavy food", "after fatty food"],
+      ["empty", "Empty stomach", "pain when hungry"], ["press", "Pressing the area"], ["stool", "Passing stool", "pain after passing stool"], ["lying", "Lying flat", "worse on lying down"],
+      ["touch", "Touching face / chewing", "pain while brushing teeth or touching face"], ["ear", "Pulling the ear", "pain on pulling ear"], ["grip", "Gripping", "pain on gripping"], ["walk", "Walking / weight-bearing"]],
+    rel: [["rest", "Rest"], ["food", "Food / antacid", "relieved by food"], ["stool", "Passing stool", "relieved by passing stool"], ["lean", "Sitting forward"], ["meds", "Painkillers"], ["nothing", "Nothing helps"]],
+    assoc: [["fever", "Fever", "fever"], ["vomit", "Vomiting", "vomiting"], ["nausea", "Nausea", "nausea"], ["sweat", "Sweating", "sweating"], ["breath", "Breathlessness", "breathlessness"],
+      ["hematuria", "Blood in urine", "blood in urine"], ["dysuria", "Burning urination", "burning urination"], ["swelling", "Swelling"], ["numb", "Numbness / tingling", "tingling"],
+      ["injury", "Injury / fall", "injury"], ["missed", "Missed period", "missed period"], ["discharge", "Vaginal discharge", "vaginal discharge"], ["blister", "Blisters / rash", "rash with blisters"],
+      ["redeye", "Red eye", "red eye"], ["halos", "Halos / blurred vision", "halos around lights"], ["bladder", "Bladder/bowel loss, saddle numbness", "loss of bladder control"],
+      ["jaundice", "Yellow eyes", "jaundice"], ["bleedanus", "Blood with stool", "fresh blood after stool"]]
+  };
+  function pv(list, v) { for (var i = 0; i < list.length; i++) if (list[i][0] === v) return list[i]; return null; }
+  function checkedVals(id) { return qsa("#" + id + " input:checked").map(function (i) { return i.value; }); }
+  function painPhrases() {
+    if (!$("painSite")) return [];
+    var site = $("painSite").value, ch = $("painChar").value, out = [], x;
+    if ((x = pv(PAIN.site, site)) && x[2]) out.push(x[2]);
+    if ($("painOnset").value === "sudden") out.push("sudden onset");
+    var chestish = site === "chest" || site === "chestwall";
+    if (ch === "burning") out.push(site === "epi" ? "burning in stomach" : chestish ? "burning chest" : "burning pain");
+    if (ch === "throbbing" && /head/.test(site)) out.push("throbbing headache");
+    if (ch === "colicky" || ch === "cramping") out.push("colicky");
+    if (ch === "pressure" && chestish) out.push("pressure in chest");
+    if (ch === "electric") out.push(site === "face" ? "electric shock in face" : "shooting pain");
+    if (ch === "tearing") out.push(site === "anus" ? "tearing pain in anus" : "tearing pain");
+    if ((x = pv(PAIN.rad, $("painRad").value)) && x[2]) out.push(x[2]);
+    if ((x = pv(PAIN.time, $("painTime").value)) && x[2]) out.push(x[2]);
+    checkedVals("painAgg").forEach(function (v) {
+      var a = pv(PAIN.agg, v); if (a && a[2]) out.push(a[2]);
+      if (v === "press" && chestish) out.push("chest wall tenderness");
+      if (v === "walk" && site === "hip") out.push("groin pain on walking");
+    });
+    checkedVals("painRel").forEach(function (v) { var a = pv(PAIN.rel, v); if (a && a[2]) out.push(a[2]); });
+    checkedVals("painAssoc").forEach(function (v) {
+      var a = pv(PAIN.assoc, v); if (a && a[2]) out.push(a[2]);
+      if (v === "swelling") out.push(site === "calf" ? "calf swelling" : site === "ankle" ? "ankle swelling" : "joint swelling");
+    });
+    var dur = $("painDur").value.trim();
+    if (dur && /\d/.test(dur) && !/\d+\s*(day|week|month|din)/i.test($("complaint").value)) out.push("since " + dur);
+    return out;
+  }
+  function painSummary() {
+    if (!$("painSite")) return "";
+    var parts = [], sev = +$("painSev").value || 0, x;
+    function lab(list, id, name) { var v = pv(list, $(id).value); if (v && v[0]) parts.push(name + ": " + v[1]); }
+    lab(PAIN.site, "painSite", "Site"); if ($("painOnset").value) parts.push("Onset: " + $("painOnset").value);
+    lab(PAIN.chr, "painChar", "Character"); lab(PAIN.rad, "painRad", "Radiation"); lab(PAIN.time, "painTime", "Pattern");
+    if ($("painDur").value.trim()) parts.push("Duration: " + $("painDur").value.trim());
+    var a = checkedVals("painAgg").map(function (v) { return pv(PAIN.agg, v)[1]; }); if (a.length) parts.push("Worse with: " + a.join(", "));
+    var r = checkedVals("painRel").map(function (v) { return pv(PAIN.rel, v)[1]; }); if (r.length) parts.push("Better with: " + r.join(", "));
+    var s2 = checkedVals("painAssoc").map(function (v) { return pv(PAIN.assoc, v)[1]; }); if (s2.length) parts.push("Associated: " + s2.join(", "));
+    if (!parts.length && !sev) return "";
+    x = sev ? "Severity " + sev + "/10 (" + (sev <= 3 ? "mild" : sev <= 6 ? "moderate" : "severe") + ")" : "Severity not scored";
+    return x + (parts.length ? " · " + parts.join(" · ") : "");
+  }
+  function updatePainSummary() { $("painSevOut").textContent = $("painSev").value; var t = painSummary(); $("painSummary").textContent = t ? "Summary: " + t : ""; }
+  function initPain() {
+    function opts(id, list) { $(id).innerHTML = list.map(function (o) { return '<option value="' + o[0] + '">' + esc(o[1]) + "</option>"; }).join(""); }
+    opts("painSite", PAIN.site); opts("painChar", PAIN.chr); opts("painRad", PAIN.rad); opts("painTime", PAIN.time);
+    function checks(id, list) { $(id).innerHTML = list.map(function (o) { return '<label><input type="checkbox" value="' + o[0] + '">' + esc(o[1]) + "</label>"; }).join(""); }
+    checks("painAgg", PAIN.agg); checks("painRel", PAIN.rel); checks("painAssoc", PAIN.assoc);
+    qsa("#painSite, #painOnset, #painChar, #painRad, #painTime, #painDur, #painSev, #painAgg input, #painRel input, #painAssoc input").forEach(function (el) {
+      el.addEventListener(el.type === "range" || el.tagName === "INPUT" && el.type !== "checkbox" ? "input" : "change", function () { updatePainSummary(); if ($("painPlan")) renderPainPlan(); });
+    });
+    updatePainSummary();
+  }
+
+  /* pain-control plan: WHO ladder adapted to pain type + patient safety */
+  function painPlanSpec() {
+    var sev = +$("painSev").value || 0, pr = (S.ext || {}).present || {}, c = S.cond;
+    var painCond = c && /Pain|Musculoskeletal|Rheumatology|Injury/.test(c.sys);
+    var painish = pr.headache || pr.back_pain || pr.joint_pain || pr.body_ache || pr.neck_pain || pr.abdominal_pain || pr.chest_pain || pr.toothache || pr.ear_pain;
+    if (!sev && !painCond && !(painish && c && c.id !== "custom")) return null;
+    var scored = sev > 0; if (!scored) sev = 4;
+    var type = "nociceptive";
+    if (c && ["neuropathy", "zoster", "trigeminal"].indexOf(c.id) >= 0) type = "neuropathic";
+    else if ((pr.neuropathic || pr.burning_pain || pr.face_shock) && !(c && c.id === "sciatica")) type = "neuropathic";
+    if (c && ["renal_colic", "biliary"].indexOf(c.id) >= 0) type = "colic";
+    if (c && c.emergency) type = "emergency";
+    var msk = (c && /Musculoskeletal|Rheumatology|Injury/.test(c.sys)) || pr.back_pain || pr.knee_pain || pr.neck_pain || pr.shoulder_pain || pr.ankle_pain || pr.muscle_strain;
+    var items = [], notes = [];
+    if (type === "emergency") notes.push("Emergency condition - give analgesia per emergency protocol during transfer (IV paracetamol / titrated opioid). Never withhold analgesia; it does not mask the diagnosis.");
+    else if (type === "neuropathic") {
+      items.push({ d: "pregabalin", dose: "75 mg", s: "0-0-1", t: "At bedtime", days: 14, note: "Titrate weekly",
+        alt: { d: "amitriptyline", dose: "10 mg", s: "0-0-1", t: "At bedtime", days: 30, alt: { d: "duloxetine", dose: "30 mg", s: "1-0-0", t: "After food", days: 30 } } });
+      notes.push("Nerve pain responds poorly to paracetamol / NSAIDs. First-line: pregabalin / gabapentin, amitriptyline or duloxetine; review in 2-4 weeks and titrate.");
+    } else if (type === "colic") {
+      items.push({ d: "diclofenac", dose: "50 mg", s: "1-1-1", t: "After food", days: 3, alt: { d: "paracetamol", dose: "650 mg", s: "1-1-1", t: "After food", days: 3 } });
+      if (sev >= 7) notes.push("Severe colic: diclofenac 75 mg IM stat in clinic (if no contraindication). Pain uncontrolled after that = emergency referral.");
+    } else {
+      items.push({ d: "paracetamol", dose: "650 mg", s: "1-1-1", t: "After food", days: 5, prn: sev <= 3, note: "Max 4 g/day" });
+      if (msk) items.push({ d: "diclofenac_gel", dose: "Thin layer", s: "1-1-1", t: "Local application", days: 7 });
+      if (sev >= 4) items.push({ d: "ibuprofen", dose: "400 mg", s: "1-1-1", t: "After food", days: 5, note: "Shortest course" });
+      if (sev >= 7) {
+        items.push({ d: "tramadol", dose: "50 mg", s: "1-0-1", t: "After food", days: 3, prn: true, cond: "Only if paracetamol + NSAID insufficient; maximum 3-5 days" });
+        notes.push("Severe pain (7/10 or more): re-examine for red flags and missed diagnoses (fracture, ischaemia, surgical abdomen). Consider parenteral analgesia or referral.");
+      }
+      if (msk) notes.push("Musculoskeletal: ice for the first 48 h then heat; keep active; physiotherapy beats bed rest.");
+    }
+    if (pr.headache) notes.push("Headache: limit painkillers to under 10 days a month to avoid medication-overuse headache.");
+    if (!scored) notes.unshift("Pain severity not scored - plan assumes moderate pain. Set the severity slider for a tailored plan.");
+    return { sev: sev, scored: scored, type: type, items: items, notes: notes };
+  }
+  function renderPainPlan() {
+    var box = $("painPlan"); if (!box) return;
+    var spec = painPlanSpec();
+    if (!spec) { box.innerHTML = ""; return; }
+    var P = getPatient();
+    var label = { nociceptive: "Nociceptive (tissue) pain", neuropathic: "Neuropathic (nerve) pain", colic: "Visceral colic", emergency: "Emergency pain" }[spec.type];
+    var h = '<h3>Pain control plan - ' + esc(label) + (spec.scored ? " · " + spec.sev + "/10" : "") + "</h3>";
+    spec.notes.forEach(function (n) { h += '<div class="alert info">' + esc(n) + "</div>"; });
+    if (spec.items.length) {
+      h += '<div class="tbl-wrap"><table><tr><th>Suggested</th><th>Dose / schedule</th><th>Safety for this patient</th><th></th></tr>';
+      S.painLines = spec.items.map(function (it) { return applyPaed(resolveItem(it, P), P); });
+      S.painLines.forEach(function (l, i) {
+        var inRx = S.rx.some(function (r) { return r.d === l.d; });
+        var chip = l.st === "block" ? '<span class="status block">BLOCKED</span>' : l.st === "warn" ? '<span class="status warn">CAUTION</span>' : '<span class="status ok">OK</span>';
+        var m = l.replaced.concat(l.msgs).concat(l.cond ? ["Condition: " + l.cond] : []);
+        h += "<tr><td><b>" + esc(l.name) + "</b></td><td>" + esc(l.dose + " · " + l.s + " · " + l.t + " · " + l.days + " d" + (l.prn ? " · SOS" : "")) + "</td><td>" + chip +
+          (m.length ? '<div class="msgs">' + esc(m.join(" | ")) + "</div>" : "") + "</td><td>" +
+          (inRx ? '<span class="hint">In prescription</span>' : l.st === "block" ? '<span class="hint">Not suitable</span>' : '<button class="btn sm" data-painadd="' + i + '">+ Add</button>') + "</td></tr>";
+      });
+      h += "</table></div>";
+    }
+    box.innerHTML = h;
+    qsa("[data-painadd]", box).forEach(function (b) {
+      b.addEventListener("click", function () {
+        var l = S.painLines[+b.getAttribute("data-painadd")];
+        if (S.rx.some(function (r) { return r.d === l.d; })) return;
+        S.rx.push(JSON.parse(JSON.stringify(l))); renderRx(); toast(l.name + " added");
+      });
+    });
+  }
+
+  /* ---------- web knowledge ---------- */
+  var FDA_NAME = { paracetamol: "acetaminophen", salbutamol_inh: "albuterol", amox_clav: "amoxicillin and clavulanate potassium", budesonide_formoterol: "budesonide and formoterol",
+    fluticasone_nasal: "fluticasone propionate", isabgol: "psyllium", doac: "apixaban", ssri: "sertraline", benzo: "alprazolam", ceftriaxone_inj: "ceftriaxone",
+    lidocaine_jelly: "lidocaine", moxifloxacin_eye: "moxifloxacin", ofloxacin_ear: "ofloxacin", clotrimazole_cream: "clotrimazole", clotrimazole_pessary: "clotrimazole",
+    terbinafine_cream: "terbinafine", diclofenac_gel: "diclofenac", chlorhexidine_mw: "chlorhexidine gluconate", cotrimoxazole: "sulfamethoxazole and trimethoprim",
+    metoprolol: "metoprolol succinate", warfarin: "warfarin", ferrous_sulfate: "ferrous sulfate", luliconazole: "luliconazole", benzoyl_peroxide: "benzoyl peroxide",
+    ors: null, saline_nasal: null, antacid: null, methylcobalamin: null, calcium_d3: null, cmc_eye: null, hyoscine: null, drotaverine: null, aceclofenac: null,
+    etoricoxib: null, thiocolchicoside: null, racecadotril: null, flunarizine: null, betahistine: null, domperidone: null, mebeverine: null, calamine: null, xylometazoline: null };
+  function fdaName(k) {
+    if (Object.prototype.hasOwnProperty.call(FDA_NAME, k)) return FDA_NAME[k];
+    return DRUGS[k].n.split("(")[0].replace(/\s\d.*$/, "").replace(/\b(tablet|capsule|cream|gel|ointment|lotion|eye drops|ear drops|nasal spray|injection|sodium|axetil|sr|xl|ds)\b/gi, "").trim().toLowerCase();
+  }
+  function webErr(e) {
+    var msg = e && e.message === "rate" ? "the free daily limit was reached" : "no internet, a blocked network, or the service is busy";
+    return '<div class="alert caution">Web source unavailable (' + esc(msg) + "). The offline knowledge base keeps working.</div>";
+  }
+  function setNet() {
+    var on = window.IDHWeb && IDHWeb.online();
+    $("netPill").textContent = on ? "🌐 Online - web sources active" : "⚪ Offline - local engine only";
+    $("netPill").style.background = on ? "" : "#eee";
+    if ($("webStatus")) $("webStatus").innerHTML = on ? "" : '<div class="alert caution">You are offline. Web Medical Library needs internet; everything else works offline.</div>';
+  }
+  function labelHtml(label, maxChars) {
+    if (!label) return '<div class="alert caution">No U.S. FDA label found. The drug may not be marketed in the U.S. (e.g. aceclofenac, etoricoxib, domperidone, drotaverine, thiocolchicoside) - use the Indian prescribing information / CIMS and the offline formulary.</div>';
+    var h = '<div class="hint">Source: U.S. FDA label via openFDA' + (label.brand ? " (" + esc(label.brand) + ")" : "") + (label.version ? " · label date " + esc(label.version) : "") + ". U.S. doses can differ from Indian practice.</div>";
+    label.sections.forEach(function (sct) {
+      var t = sct.text.length > (maxChars || 5000) ? sct.text.slice(0, maxChars || 5000) + " …" : sct.text;
+      h += "<details" + (sct.key === "boxed_warning" ? " open" : "") + '><summary><b>' + esc(sct.title) + "</b></summary><div class=\"msgs\" style=\"white-space:pre-wrap\">" + esc(t) + "</div></details>";
+    });
+    return h;
+  }
+  function showWebDrug(opt) {
+    var out = $("wOut"), key = opt.key || null, name = opt.name;
+    var h = '<div class="card" style="margin:0"><h2>' + esc(key ? DRUGS[key].n : name) + "</h2>";
+    if (opt.strengths && opt.strengths.length) h += '<p class="hint"><b>Available strengths / forms (U.S.):</b> ' + esc(opt.strengths.join(", ")) + "</p>";
+    var bh = brandHits(name); bh.forEach(function (b) { h += '<div class="alert info"><b>' + esc(b.brand.toUpperCase()) + "</b> = " + esc(b.comp) + (b.warn ? " - " + esc(b.warn) : "") + "</div>"; });
+    if (!key) { var k2 = resolveDrug(IDHWeb.baseName(name)); if (k2) key = k2; }
+    if (key) h += '<div class="alert ok">In the offline Inera formulary: ' + esc(DRUGS[key].n) + " - " + esc(DRUGS[key].adult) + (DRUGS[key].def ? ' <button class="btn sm" id="wAdd">+ Add to prescription</button>' : "") + "</div>";
+    h += '<div class="row-btns"><input id="wIxIn" placeholder="Check this label against another drug (e.g. warfarin)"><button class="btn" id="wIxBtn">Check interaction text</button></div><div id="wIxOut"></div>';
+    h += '<div id="wLabel"><p class="hint">Loading FDA prescribing information…</p></div></div>';
+    out.innerHTML = h;
+    if ($("wAdd")) $("wAdd").addEventListener("click", function () { if (addDrugKey(key)) toast(DRUGS[key].n + " added to prescription"); });
+    var q = key ? fdaName(key) : IDHWeb.baseName(name), labelObj = null;
+    if (!q) { $("wLabel").innerHTML = labelHtml(null); return; }
+    IDHWeb.fdaLabel(q).then(function (l) { labelObj = l; $("wLabel").innerHTML = labelHtml(l); }, function (e) { $("wLabel").innerHTML = webErr(e); });
+    $("wIxBtn").addEventListener("click", function () {
+      var other = $("wIxIn").value.trim(); if (!other) return;
+      var ok2 = resolveDrug(other), names = [other.toLowerCase()];
+      if (ok2 && fdaName(ok2)) names.push(fdaName(ok2));
+      if (ok2) (DRUGS[ok2].tags || []).forEach(function (t) { if (t === "anticoag") names.push("anticoagulant", "warfarin"); if (t === "nsaid") names.push("NSAID", "NSAIDs"); if (t === "ssri") names.push("SSRI", "SSRIs"); });
+      var local = key && ok2 ? interactions([key, ok2]) : [];
+      var h2 = local.length ? ixHtml(local) : "";
+      var m = IDHWeb.mentions(labelObj, uniq(names));
+      h2 += m.length ? '<div class="alert urgent"><b>FDA label mentions:</b><br>' + m.map(function (x) { return "[" + esc(x.section) + "] " + esc(x.text); }).join("<br><br>") + "</div>"
+        : '<div class="hint">' + (labelObj ? "No mention of " + esc(other) + " in this label's interaction / warning text." : "Label not loaded - checked offline rules only.") + "</div>";
+      $("wIxOut").innerHTML = h2;
+    });
+  }
+  function initWeb() {
+    setNet(); window.addEventListener("online", setNet); window.addEventListener("offline", setNet);
+    var t1 = null, t2 = null;
+    $("wDrug").addEventListener("input", function () {
+      clearTimeout(t1); var q = $("wDrug").value.trim();
+      t1 = setTimeout(function () {
+        if (q.length < 2) { $("wDrugList").innerHTML = ""; return; }
+        var ql = q.toLowerCase(), local = [];
+        brandHits(q).forEach(function (b) { local.push('<button class="chip" data-wloc="' + esc(b.brand) + '">📦 ' + esc(b.brand.toUpperCase()) + " (" + esc(b.comp) + ")</button>"); });
+        Object.keys(DRUGS).filter(function (k) { return DRUGS[k].n.toLowerCase().indexOf(ql) >= 0 || (DRUGS[k].al || []).some(function (a) { return a.indexOf(ql) === 0; }); }).slice(0, 6)
+          .forEach(function (k) { local.push('<button class="chip sym" data-wkey="' + k + '" style="cursor:pointer">💊 ' + esc(DRUGS[k].n) + " (offline)</button>"); });
+        $("wDrugList").innerHTML = local.join("") + '<span class="hint" id="wDrugWait">Searching NLM…</span>';
+        var bind = function () {
+          qsa("[data-wkey]", $("wDrugList")).forEach(function (b) { b.onclick = function () { showWebDrug({ key: b.getAttribute("data-wkey"), name: DRUGS[b.getAttribute("data-wkey")].n }); }; });
+          qsa("[data-wloc]", $("wDrugList")).forEach(function (b) { b.onclick = function () { showWebDrug({ name: b.getAttribute("data-wloc") }); }; });
+          qsa("[data-wname]", $("wDrugList")).forEach(function (b) { b.onclick = function () { var i = +b.getAttribute("data-wi"); showWebDrug({ name: S.webDrugs[i].name, strengths: S.webDrugs[i].strengths }); }; });
+        };
+        bind();
+        IDHWeb.drugSearch(q).then(function (list) {
+          if ($("wDrug").value.trim() !== q) return;
+          S.webDrugs = list;
+          var w = $("wDrugWait"); if (w) w.remove();
+          $("wDrugList").insertAdjacentHTML("beforeend", list.length ? list.map(function (d, i) { return '<button class="chip" data-wname="1" data-wi="' + i + '">🌐 ' + esc(d.name) + "</button>"; }).join("") : '<span class="hint">No web match.</span>');
+          bind();
+        }, function (e) { var w = $("wDrugWait"); if (w) w.outerHTML = webErr(e); });
+      }, 350);
+    });
+    $("wCond").addEventListener("input", function () {
+      clearTimeout(t2); var q = $("wCond").value.trim();
+      t2 = setTimeout(function () {
+        if (q.length < 2) { $("wCondList").innerHTML = ""; return; }
+        var ql = q.toLowerCase();
+        var local = CONDITIONS.filter(function (c) { return c.name.toLowerCase().indexOf(ql) >= 0; }).slice(0, 4).map(function (c) {
+          return '<button class="opt" data-wcode="' + esc(c.icd) + '" data-wcname="' + esc(c.name) + '">📦 ' + esc(c.icd + " - " + c.name) + " (offline protocol)</button>"; }).join("");
+        $("wCondList").innerHTML = local + '<span class="hint" id="wCondWait">Searching ICD-10…</span>';
+        var bind = function () { qsa("[data-wcode]", $("wCondList")).forEach(function (b) { b.onclick = function () { showWebCond(b.getAttribute("data-wcode"), b.getAttribute("data-wcname")); }; }); };
+        bind();
+        IDHWeb.icdSearch(q).then(function (list) {
+          if ($("wCond").value.trim() !== q) return;
+          var w = $("wCondWait"); if (w) w.remove();
+          $("wCondList").insertAdjacentHTML("beforeend", list.map(function (d) { return '<button class="opt" data-wcode="' + esc(d.code) + '" data-wcname="' + esc(d.name) + '">🌐 ' + esc(d.code + " - " + d.name) + "</button>"; }).join(""));
+          bind();
+        }, function (e) { var w = $("wCondWait"); if (w) w.outerHTML = webErr(e); });
+      }, 350);
+    });
+  }
+  function useDiagnosis(code, name) {
+    if (!$("fDx")) { selectCondition("custom"); }
+    $("fDx").value = name; $("fIcd").value = code;
+    qsa('.nav-btn[data-tab="consult"]')[0].click(); toast("Diagnosis set in Smart Consult");
+  }
+  function showWebCond(code, name) {
+    var local = CONDITIONS.filter(function (c) { return c.icd === code || c.name === name; })[0];
+    var h = '<div class="card" style="margin:0"><h2>' + esc(code + " - " + name) + '</h2><div class="row-btns" style="margin-top:0"><button class="btn primary" id="wUseDx">Use as diagnosis in Smart Consult</button>' +
+      (local ? '<button class="btn" id="wUseProto">Load offline protocol</button>' : "") + "</div>";
+    if (local) h += '<div class="alert ok">Offline Inera protocol available: first-line management, red flags and investigations.</div>';
+    h += '<div id="wEdu"><p class="hint">Loading MedlinePlus (NIH) topics…</p></div></div>';
+    $("wOut").innerHTML = h;
+    $("wUseDx").addEventListener("click", function () { useDiagnosis(code, name); });
+    if (local) $("wUseProto").addEventListener("click", function () {
+      if (!$("results").innerHTML) { S.ext = { present: {}, negated: {}, days: null, tempF: null }; }
+      ensurePlanContainer(); selectCondition(local.id); qsa('.nav-btn[data-tab="consult"]')[0].click();
+    });
+    IDHWeb.medline(code).then(function (list) {
+      $("wEdu").innerHTML = list.length ? list.slice(0, 5).map(function (e) {
+        return '<div class="alert info"><b>' + esc(e.title) + "</b><br>" + esc(e.summary.slice(0, 600)) + (e.summary.length > 600 ? "…" : "") + '<br><a href="' + esc(e.url) + '" target="_blank" rel="noopener">Open on MedlinePlus ↗</a></div>';
+      }).join("") : '<p class="hint">No MedlinePlus topic is linked to this exact code - try the parent code (e.g. ' + esc(code.split(".")[0]) + ").</p>";
+    }, function (e) { $("wEdu").innerHTML = webErr(e); });
+  }
+  function bindIcdAutocomplete() {
+    var map = {}, t = null, inp = $("fDx");
+    inp.addEventListener("input", function () {
+      clearTimeout(t); var q = inp.value.trim();
+      if (map[q]) { $("fIcd").value = map[q]; return; }
+      if (q.length < 3 || !IDHWeb.online()) return;
+      t = setTimeout(function () {
+        IDHWeb.icdSearch(q).then(function (list) {
+          $("icdList").innerHTML = list.map(function (d) { map[d.name] = d.code; return '<option value="' + esc(d.name) + '" label="' + esc(d.code) + '">'; }).join("");
+        }, function () { /* offline: free text */ });
+      }, 300);
+    });
+    inp.addEventListener("change", function () { if (map[inp.value]) $("fIcd").value = map[inp.value]; });
+  }
+  function verifyOnline() {
+    var box = $("webVerify"), rx = activeRx(), P = getPatient();
+    if (!IDHWeb.online()) { box.innerHTML = webErr(null); return; }
+    box.innerHTML = '<p class="hint">Checking FDA labels and MedlinePlus…</p>';
+    var keys = uniq(rx.map(function (l) { return l.d; }));
+    var allNames = uniq(keys.concat(P.medKeys).map(function (k) { return fdaName(k); }).filter(Boolean));
+    var jobs = keys.map(function (k) {
+      var n = fdaName(k);
+      if (!n) return Promise.resolve({ k: k, label: null, skip: true });
+      return IDHWeb.fdaLabel(n).then(function (l) { return { k: k, label: l }; }, function (e) { return { k: k, err: e }; });
+    });
+    var icd = $("fIcd") ? $("fIcd").value.trim() : "";
+    var edu = icd ? IDHWeb.medline(icd).catch(function () { return []; }) : Promise.resolve([]);
+    Promise.all([Promise.all(jobs), edu]).then(function (res) {
+      var h = "";
+      res[0].forEach(function (r) {
+        var d = DRUGS[r.k];
+        h += '<div class="alert ' + (r.err ? "caution" : "info") + '"><b>' + esc(d.n) + "</b> - ";
+        if (r.skip) h += "not a U.S.-labelled product; verify against Indian prescribing information.";
+        else if (r.err) h += "could not reach FDA source.";
+        else if (!r.label) h += "no U.S. FDA label found.";
+        else {
+          var sec = function (key) { var s2 = r.label.sections.filter(function (x) { return x.key === key; })[0]; return s2 ? s2.text.replace(/\s+/g, " ").slice(0, 320) + (s2.text.length > 320 ? "…" : "") : ""; };
+          var bw = sec("boxed_warning"), ci = sec("contraindications"), dz = sec("dosage_and_administration");
+          if (bw) h += '<br><span class="lab-crit">Boxed warning:</span> ' + esc(bw);
+          if (ci) h += "<br><b>Contraindications:</b> " + esc(ci);
+          if (dz) h += "<br><b>FDA dosing:</b> " + esc(dz);
+          var others = allNames.filter(function (n) { return n !== fdaName(r.k); });
+          var m = IDHWeb.mentions(r.label, others);
+          h += m.length ? '<br><span class="lab-high">Label mentions co-prescribed drug(s):</span> ' + esc(m.map(function (x) { return x.other + " - " + x.text.slice(0, 220); }).join(" | ")) : "<br><span class=\"hint\">No co-prescribed drug mentioned in its interaction/warning text.</span>";
+        }
+        h += "</div>";
+      });
+      if (!keys.length) h += '<div class="hint">No medicines in the prescription.</div>';
+      S.webEdu = res[1] || [];
+      h += S.webEdu.length ? '<div class="alert ok"><b>Patient education (MedlinePlus, NIH) - added to the report:</b><br>' + S.webEdu.slice(0, 3).map(function (e) { return '<a href="' + esc(e.url) + '" target="_blank" rel="noopener">' + esc(e.title) + "</a>"; }).join(" · ") + "</div>"
+        : (icd ? '<div class="hint">No MedlinePlus topic for ' + esc(icd) + ".</div>" : "");
+      box.innerHTML = h;
+    });
+  }
+
   /* ---------- init ---------- */
   function init() {
-    $("kbStats").textContent = CONDITIONS.length + " conditions, " + Object.keys(DRUGS).length + " formulary entries, " + LABS.length + " lab parameters, " + INTERACTIONS.length + " interaction rules, " + Object.keys(SYMPTOMS).length + " symptom concepts, " + RED_FLAGS.length + " red-flag rules";
+    $("kbStats").textContent = CONDITIONS.length + " conditions, " + Object.keys(DRUGS).length + " formulary entries, " + LABS.length + " lab parameters, " + INTERACTIONS.length + " interaction rules, " + Object.keys(SYMPTOMS).length + " symptom concepts, " + RED_FLAGS.length + " red-flag rules, " + Object.keys(BR).length + " Indian combination brands mapped (plus brand aliases inside each drug)";
     var dl = "";
     Object.keys(DRUGS).sort(function (a, b) { return DRUGS[a].n.localeCompare(DRUGS[b].n); }).forEach(function (k) { dl += '<option value="' + esc(DRUGS[k].n) + '">'; });
     $("drugNames").innerHTML = dl;
@@ -972,6 +1344,8 @@
     renderCalcs();
     loadDoc();
     setupVoice();
+    initPain();
+    initWeb();
   }
 
   window.IDH = { extract: extract, rank: rank, checkDrug: checkDrug, interactions: interactions, analyzeLabs: analyzeLabs, qty: qty, egfr: egfrCalc, S: S, patientText: patientText };
